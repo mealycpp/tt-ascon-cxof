@@ -1,8 +1,13 @@
-"""ASCON-CXOF tests, robust UART recv via prolonged-idle wait."""
+"""Full-stack chip test, deterministic-timing receiver.
+
+After locking onto the first byte's start bit, subsequent bytes are
+decoded at fixed offsets of 10 bit-periods from the previous start edge.
+This avoids the mid-byte-edge confusion entirely.
+"""
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import Timer
+from cocotb.triggers import RisingEdge, Timer
 
 SOF = 0xAA
 EOF_BYTE = 0x55
@@ -19,6 +24,7 @@ ST_OK = 0x00
 CLOCK_PERIOD_NS = 20
 BAUD_DIV = 434
 BIT_PERIOD_NS = CLOCK_PERIOD_NS * BAUD_DIV
+BYTE_PERIOD_NS = BIT_PERIOD_NS * 10   # 10 = start + 8 data + stop
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -59,70 +65,84 @@ def _tx(dut):
     return int(dut.uo_out.value) & 1
 
 
-async def _wait_extended_idle(dut, idle_clocks=5):
-    """Wait until tx has been HIGH for `idle_clocks` consecutive cycles."""
-    high_streak = 0
-    for _ in range(2_000_000):
-        await Timer(CLOCK_PERIOD_NS, units="ns")
-        if _tx(dut) == 1:
-            high_streak += 1
-            if high_streak >= idle_clocks:
-                return
-        else:
-            high_streak = 0
-    raise TimeoutError("tx never sustained idle high")
-
-
-async def uart_recv_byte(dut, wait_idle_first=True):
-    """Receive one UART byte.
-
-    If wait_idle_first is True, first ensure tx has been idle high for a few
-    clocks (covers the case where we just finished sending and the chip is
-    about to start responding).  Then poll for falling edge.  Then sample
-    mid-bit for each of 8 data bits.
+class FrameRecv:
+    """Tracks the chip's TX line. The first falling edge from idle is the
+    start of the response frame; all subsequent bytes follow at fixed
+    BYTE_PERIOD intervals.
     """
-    if wait_idle_first:
-        # Brief idle check; if tx is already low (chip already responding)
-        # this returns quickly via the timeout, then we still catch the edge.
-        try:
-            await _wait_extended_idle(dut, idle_clocks=3)
-        except TimeoutError:
-            pass
+    HIGH_THRESHOLD_NS = BIT_PERIOD_NS * 2     # 2 bit periods of idle = frame boundary
 
-    # Poll for falling edge
-    for _ in range(2_000_000):
-        await Timer(CLOCK_PERIOD_NS, units="ns")
-        if _tx(dut) == 0:
-            break
-    else:
-        raise TimeoutError("no falling edge")
+    def __init__(self, dut):
+        self.dut = dut
+        self.first_edge_ns = None      # sim time of frame's first start bit
+        self.bytes_consumed = 0
 
-    # We may have detected the falling edge up to CLOCK_PERIOD_NS late.
-    # Wait one full bit period to reach mid-bit-0.
-    await Timer(BIT_PERIOD_NS, units="ns")
-    byte = 0
-    for i in range(8):
-        byte |= (_tx(dut) << i)
-        if i < 7:
-            await Timer(BIT_PERIOD_NS, units="ns")
-    return byte
+    async def watcher(self):
+        """Background: find the first frame-start falling edge.
+
+        Frame-start = at least 2 bit-periods of continuous HIGH followed
+        by a falling edge. Starting with high_ns=0 forces the watcher
+        to genuinely observe idle before accepting any falling edge,
+        which prevents locking onto residual mid-byte transitions from
+        a previous frame.
+        """
+        high_ns = 0
+        prev = 1
+        while self.first_edge_ns is None:
+            await RisingEdge(self.dut.clk)
+            cur = _tx(self.dut)
+            if cur == 1:
+                high_ns += CLOCK_PERIOD_NS
+                prev = 1
+            else:
+                if prev == 1 and high_ns >= self.HIGH_THRESHOLD_NS:
+                    self.first_edge_ns = cocotb.utils.get_sim_time(units='ns')
+                    return
+                high_ns = 0
+                prev = 0
+
+    async def wait_first_edge(self):
+        while self.first_edge_ns is None:
+            await RisingEdge(self.dut.clk)
+
+    async def recv_byte(self):
+        """Decode the next byte at the expected time offset."""
+        await self.wait_first_edge()
+        target_start = self.first_edge_ns + self.bytes_consumed * BYTE_PERIOD_NS
+        t_now = cocotb.utils.get_sim_time(units='ns')
+        # land at mid-bit-0 = target_start + 1.5 * BIT_PERIOD
+        target = target_start + (BIT_PERIOD_NS * 3) // 2
+        if target > t_now:
+            await Timer(int(round(target - t_now)), units="ns")
+        byte = 0
+        for i in range(8):
+            bit = _tx(self.dut)
+            byte |= (bit << i)
+            if i < 7:
+                await Timer(BIT_PERIOD_NS, units="ns")
+        self.bytes_consumed += 1
+        self.dut._log.info(f"recv b={byte:02x} idx={self.bytes_consumed-1} first_edge={self.first_edge_ns}")
+        return byte
+
+    def reset_for_next_frame(self):
+        """Call before expecting another frame from the chip."""
+        self.first_edge_ns = None
+        self.bytes_consumed = 0
 
 
-async def uart_recv_frame(dut):
-    sof = await uart_recv_byte(dut, wait_idle_first=True)
+async def recv_frame(rcv: FrameRecv):
+    sof = await rcv.recv_byte()
     assert sof == SOF, f"expected SOF, got {sof:02x}"
-    # subsequent bytes follow immediately, no extended idle between them
-    length = await uart_recv_byte(dut, wait_idle_first=False)
-    status = await uart_recv_byte(dut, wait_idle_first=False)
-    payload = bytes([await uart_recv_byte(dut, wait_idle_first=False)
-                     for _ in range(length - 1)])
-    crc_lo = await uart_recv_byte(dut, wait_idle_first=False)
-    crc_hi = await uart_recv_byte(dut, wait_idle_first=False)
-    eof = await uart_recv_byte(dut, wait_idle_first=False)
+    length = await rcv.recv_byte()
+    status = await rcv.recv_byte()
+    payload = bytes([await rcv.recv_byte() for _ in range(length - 1)])
+    crc_lo = await rcv.recv_byte()
+    crc_hi = await rcv.recv_byte()
+    eof = await rcv.recv_byte()
     assert eof == EOF_BYTE, f"expected EOF, got {eof:02x}"
     expected_crc = crc16_ccitt(bytes([length, status]) + payload)
     actual_crc = crc_lo | (crc_hi << 8)
-    assert expected_crc == actual_crc, f"CRC mismatch"
+    assert expected_crc == actual_crc, f"CRC mismatch: got {actual_crc:04x}, expected {expected_crc:04x}"
     return status, payload
 
 
@@ -137,10 +157,55 @@ async def _setup(dut):
     await Timer(200, units="ns")
 
 
+async def send_and_recv(dut, frame_bytes):
+    """Send a request, return the chip's response (status, payload)."""
+    # ensure chip's tx is solidly idle (HIGH) for >=3 bit periods before
+    # starting the watcher.  Otherwise watcher can lock onto residual
+    # transitions from a previous frame's tail.
+    for _ in range(50):
+        high_streak = 0
+        for _ in range(BIT_PERIOD_NS * 3 // CLOCK_PERIOD_NS):
+            await RisingEdge(dut.clk)
+            if _tx(dut) == 1:
+                high_streak += 1
+            else:
+                high_streak = 0
+                break
+        if high_streak >= (BIT_PERIOD_NS * 3 // CLOCK_PERIOD_NS):
+            break
+    rcv = FrameRecv(dut)
+    cocotb.start_soon(rcv.watcher())
+    await uart_send_frame(dut, frame_bytes)
+    return await recv_frame(rcv)
+
+
 @cocotb.test()
 async def test_ping(dut):
     await _setup(dut)
-    await uart_send_frame(dut, build_frame(CMD_PING))
-    status, payload = await uart_recv_frame(dut)
+    status, payload = await send_and_recv(dut, build_frame(CMD_PING))
     assert status == ST_OK
     assert payload == b""
+    dut._log.info("PING ok")
+
+
+@cocotb.test()
+async def test_get_version(dut):
+    await _setup(dut)
+    status, payload = await send_and_recv(dut, build_frame(CMD_GET_VERSION))
+    assert status == ST_OK
+    assert len(payload) == 2
+    assert payload[0] == 0x01
+    assert payload[1] == 0xAC
+
+
+@cocotb.test()
+async def test_write_read_register(dut):
+    """Real verification: write 0x10 to register 0x02, read it back, expect 0x10."""
+    await _setup(dut)
+    s, _ = await send_and_recv(dut, build_frame(CMD_WRITE_REG, bytes([0x02, 0x10])))
+    assert s == ST_OK, f"write status {s:02x}"
+    s, p = await send_and_recv(dut, build_frame(CMD_READ_REG, bytes([0x02])))
+    assert s == ST_OK, f"read status {s:02x}"
+    assert len(p) == 1, f"read payload len {len(p)}"
+    assert p[0] == 0x10, f"expected 0x10, got 0x{p[0]:02x}"
+    dut._log.info("write/read register ok")

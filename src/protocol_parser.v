@@ -99,6 +99,7 @@ module protocol_parser (
     localparam S_BUILD_RESP  = 4'd8;
     localparam S_SEND_RESP   = 4'd9;
     localparam S_ERROR       = 4'd10;
+    localparam S_WAIT_RF_READ = 4'd11;
 
     reg [3:0] state;
 
@@ -283,9 +284,9 @@ module protocol_parser (
                             end else begin
                                 rf_addr <= payload[0];
                                 rf_re   <= 1'b1;
-                                // wait one cycle for rdata
+                                // register_file rdata is synchronous; wait one cycle
                                 resp_len <= 7'd1;
-                                state    <= S_BUILD_RESP;  // we'll capture rdata in resp build
+                                state    <= S_WAIT_RF_READ;
                             end
                         end
                         CMD_START: begin
@@ -316,6 +317,11 @@ module protocol_parser (
                     endcase
                 end
 
+                S_WAIT_RF_READ: begin
+                    // bubble cycle for register_file synchronous read
+                    state <= S_BUILD_RESP;
+                end
+
                 S_BUILD_RESP: begin
                     // capture rdata if a read was issued in DISPATCH
                     if (frame_cmd == CMD_READ_REG || frame_cmd == CMD_GET_STATUS) begin
@@ -324,10 +330,6 @@ module protocol_parser (
                     tx_idx         <= 7'd0;
                     tx_phase       <= 4'd0;
                     tx_running_crc <= 16'hFFFF;
-            for (i = 0; i < 64; i = i + 1) begin
-                payload[i]      <= 8'd0;
-                resp_payload[i] <= 8'd0;
-            end
                     state          <= S_SEND_RESP;
                 end
 
