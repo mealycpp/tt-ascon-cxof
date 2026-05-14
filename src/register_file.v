@@ -117,9 +117,9 @@ module register_file (
                     8'h05: out_length[15:8]  <= wdata;
                     default: begin
                         if (addr >= 8'h10 && addr <= 8'h2F) begin
-                            cs_data  <= write_byte_32(cs_data,  addr[4:0], wdata);
+                            cs_data  <= write_byte_32(cs_data,  (addr - 8'h10), wdata);
                         end else if (addr >= 8'h30 && addr <= 8'h4F) begin
-                            msg_data <= write_byte_32(msg_data, addr[4:0], wdata);
+                            msg_data <= write_byte_32(msg_data, (addr - 8'h30), wdata);
                         end
                     end
                 endcase
@@ -137,11 +137,11 @@ module register_file (
                     8'h81: rdata <= 8'hAC;
                     default: begin
                         if (addr >= 8'h10 && addr <= 8'h2F)
-                            rdata <= read_byte_32(cs_data,  addr[4:0]);
+                            rdata <= read_byte_32(cs_data,        (addr - 8'h10));
                         else if (addr >= 8'h30 && addr <= 8'h4F)
-                            rdata <= read_byte_32(msg_data, addr[4:0]);
+                            rdata <= read_byte_32(msg_data,       (addr - 8'h30));
                         else if (addr >= 8'h50 && addr <= 8'h6F)
-                            rdata <= read_byte_32(result_latched, addr[4:0]);
+                            rdata <= read_byte_32(result_latched, (addr - 8'h50));
                         else
                             rdata <= 8'h00;
                     end

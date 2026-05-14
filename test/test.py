@@ -209,3 +209,155 @@ async def test_write_read_register(dut):
     assert len(p) == 1, f"read payload len {len(p)}"
     assert p[0] == 0x10, f"expected 0x10, got 0x{p[0]:02x}"
     dut._log.info("write/read register ok")
+
+
+# ===== End-to-end CXOF KAT tests through UART =====
+
+KATS = [
+    {"name": "Count=1: empty cs, empty msg", "cs": b"", "msg": b"",
+     "expected": bytes.fromhex("4F50159EF70BB3DAD8807E034EAEBD44C4FA2CBBC8CF1F05511AB66CDCC52990")},
+    {"name": "Count=2: 1B cs",  "cs": bytes([0x10]), "msg": b"",
+     "expected": bytes.fromhex("0C93A483E7D574D49FE52CCE03EE646117977D57A8AA57704AB4DAF44B501430")},
+    {"name": "Count=3: 2B cs",  "cs": bytes([0x10, 0x11]), "msg": b"",
+     "expected": bytes.fromhex("D1106C7622E79FE955BD9D79E03B918E770FE0E0CDDDE28BEB924B02C5FC936B")},
+    {"name": "Count=9: 8B cs",  "cs": bytes(range(0x10, 0x18)), "msg": b"",
+     "expected": bytes.fromhex("61324766441DD6C11E1736BAD1D2185820885ED76FE2CE537775A6E855EEAFD2")},
+    {"name": "Count=100: msg=3B, cs=empty", "cs": b"", "msg": bytes([0x00, 0x01, 0x02]),
+     "expected": bytes.fromhex("1093DA88C318F6D9F26E1A222DBC30016D03953EDFD9BA3D75D7D8451B9DF542")},
+    {"name": "Count=50: msg=1B, cs=16B", "cs": bytes(range(0x10, 0x20)), "msg": bytes([0x00]),
+     "expected": bytes.fromhex("2B024A542F34D07360EE5FC3AC5A5ADE3F144DE1959C7BBCF2664357A47C6F12")},
+    {"name": "Count=500: msg=15B, cs=4B", "cs": bytes([0x10, 0x11, 0x12, 0x13]),
+     "msg": bytes(range(0x00, 0x0F)),
+     "expected": bytes.fromhex("FA0E8B98F0F30CC376879268A72FF602BA483F857FCAE88F7A3E66E6289A116C")},
+    {"name": "Count=1000: msg=30B, cs=9B", "cs": bytes(range(0x10, 0x19)),
+     "msg": bytes(range(0x00, 0x1E)),
+     "expected": bytes.fromhex("D3CB03D419D215D91733CEDBB709CA48BCAD775BD5321698F5F032B2B042D904")},
+]
+
+# Register map (matches docs/info.md)
+REG_CS_LENGTH    = 0x02
+REG_MSG_LENGTH   = 0x03
+REG_OUT_LEN_LO   = 0x04
+REG_OUT_LEN_HI   = 0x05
+REG_CS_BASE      = 0x10
+REG_MSG_BASE     = 0x30
+REG_OUT_BASE     = 0x50
+REG_STATUS       = 0x00
+
+
+async def write_reg(dut, addr, data):
+    """Write one byte to a register."""
+    s, _ = await send_and_recv(dut, build_frame(CMD_WRITE_REG, bytes([addr, data])))
+    assert s == ST_OK, f"WRITE_REG addr=0x{addr:02x} returned status 0x{s:02x}"
+
+
+async def read_reg(dut, addr):
+    """Read one byte from a register."""
+    s, p = await send_and_recv(dut, build_frame(CMD_READ_REG, bytes([addr])))
+    assert s == ST_OK, f"READ_REG addr=0x{addr:02x} returned status 0x{s:02x}"
+    assert len(p) == 1, f"READ_REG returned {len(p)} bytes"
+    return p[0]
+
+
+async def run_uart_kat(dut, kat):
+    """Run one KAT through the full UART path: write inputs, start, poll, read output."""
+    dut._log.info(f"=== UART KAT: {kat['name']} ===")
+
+    # Load CS bytes
+    for i, b in enumerate(kat["cs"]):
+        await write_reg(dut, REG_CS_BASE + i, b)
+    # Load MSG bytes
+    for i, b in enumerate(kat["msg"]):
+        await write_reg(dut, REG_MSG_BASE + i, b)
+    # Set lengths
+    await write_reg(dut, REG_CS_LENGTH, len(kat["cs"]))
+    await write_reg(dut, REG_MSG_LENGTH, len(kat["msg"]))
+    await write_reg(dut, REG_OUT_LEN_LO, 32 & 0xFF)
+    await write_reg(dut, REG_OUT_LEN_HI, (32 >> 8) & 0xFF)
+
+    # Start
+    s, _ = await send_and_recv(dut, build_frame(CMD_START))
+    assert s == ST_OK, f"START returned 0x{s:02x}"
+
+    # Poll status until busy=0 (bit 0 = busy, bit 1 = done)
+    for poll in range(200):
+        status = await read_reg(dut, REG_STATUS)
+        if status & 0x08:    # result_present (latched)
+            break
+    else:
+        raise TimeoutError("result_present never asserted")
+
+    # Read 32 output bytes
+    got = bytes([await read_reg(dut, REG_OUT_BASE + i) for i in range(32)])
+
+    dut._log.info(f"  got:  {got.hex().upper()}")
+    dut._log.info(f"  want: {kat['expected'].hex().upper()}")
+    assert got == kat["expected"], f"KAT mismatch for {kat['name']}"
+    dut._log.info(f"  PASS")
+
+
+@cocotb.test()
+async def test_uart_kat_count1(dut):
+    """First KAT through UART path. If this passes, the full data path works."""
+    await _setup(dut)
+    await run_uart_kat(dut, KATS[0])
+
+
+@cocotb.test()
+async def test_uart_all_kats(dut):
+    """Run all 8 KATs through the UART path, with chip reset between each."""
+    failures = []
+    for i, kat in enumerate(KATS):
+        await _setup(dut)   # full reset between KATs to clear result_present latch
+        try:
+            await run_uart_kat(dut, kat)
+            dut._log.info(f"KAT {i+1}/{len(KATS)} OK")
+        except AssertionError as e:
+            failures.append(f"{kat['name']}: {e}")
+            dut._log.error(f"KAT {i+1}/{len(KATS)} FAILED: {e}")
+    if failures:
+        for f in failures:
+            dut._log.error(f"  - {f}")
+        raise AssertionError(f"{len(failures)}/{len(KATS)} KATs failed")
+    dut._log.info(f"All {len(KATS)} KATs passed through UART path")
+
+
+@cocotb.test()
+async def test_uart_kat_001(dut):
+    await _setup(dut)
+    await run_uart_kat(dut, KATS[0])
+
+@cocotb.test()
+async def test_uart_kat_002(dut):
+    await _setup(dut)
+    await run_uart_kat(dut, KATS[1])
+
+@cocotb.test()
+async def test_uart_kat_003(dut):
+    await _setup(dut)
+    await run_uart_kat(dut, KATS[2])
+
+@cocotb.test()
+async def test_uart_kat_004(dut):
+    await _setup(dut)
+    await run_uart_kat(dut, KATS[3])
+
+@cocotb.test()
+async def test_uart_kat_005(dut):
+    await _setup(dut)
+    await run_uart_kat(dut, KATS[4])
+
+@cocotb.test()
+async def test_uart_kat_006(dut):
+    await _setup(dut)
+    await run_uart_kat(dut, KATS[5])
+
+@cocotb.test()
+async def test_uart_kat_007(dut):
+    await _setup(dut)
+    await run_uart_kat(dut, KATS[6])
+
+@cocotb.test()
+async def test_uart_kat_008(dut):
+    await _setup(dut)
+    await run_uart_kat(dut, KATS[7])
